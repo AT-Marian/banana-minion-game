@@ -1,0 +1,4 @@
+project_id = "unyitwrsfnzbwsjmspok"
+
+[functions.banana-api]
+verify_jwt = false
