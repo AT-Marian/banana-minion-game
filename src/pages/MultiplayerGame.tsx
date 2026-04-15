@@ -43,7 +43,6 @@ const MultiplayerGame = () => {
   const [isJoining, setIsJoining] = useState(false);
   const [joinCode, setJoinCode] = useState("");
   const [copied, setCopied] = useState(false);
-  const [linkCopied, setLinkCopied] = useState(false);
 
   const isPlayer1 = room?.player1_id === user?.id;
 
@@ -70,7 +69,7 @@ const MultiplayerGame = () => {
     if (!roomId) return;
 
     const channel = supabase
-      .channel(`multiplayer-${roomId}`)
+      .channel(`room_sync_${roomId}`)
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "multiplayer_rooms", filter: `id=eq.${roomId}` },
@@ -78,13 +77,13 @@ const MultiplayerGame = () => {
           const updatedRoom = payload.new as any;
           setRoom(updatedRoom);
 
-          // P1 transition: Waiting -> Playing
-          if (screen === "waiting" && updatedRoom.status === "playing" && updatedRoom.player2_id) {
+          // P1 transition: Waiting -> Playing (triggered by P2 joining)
+          if (screen === "waiting" && updatedRoom.player2_id && updatedRoom.status === "playing") {
             setScreen("playing");
             loadQuestion();
           }
 
-          // Sync Round Changes
+          // Sync Round Changes (Next question)
           if (screen === "playing" && updatedRoom.current_round !== room?.current_round) {
             loadQuestion();
           }
@@ -100,62 +99,72 @@ const MultiplayerGame = () => {
     return () => { supabase.removeChannel(channel); };
   }, [roomId, screen, room?.current_round, loadQuestion]);
 
-  // --- 3. Join Logic (The Fix) ---
+  // --- 3. Join Logic (Improved Error Handling) ---
   const joinRoomWithCode = async (code: string) => {
     if (!user || !profile || !code.trim()) return;
     const cleanCode = code.trim().toUpperCase();
     setIsJoining(true);
 
     try {
-      // Step 1: Find the room
-      const { data: existingRoom, error: findError } = await supabase
+      // Step 1: Find the room based on the code
+      const { data: rooms, error: findError } = await supabase
         .from("multiplayer_rooms")
         .select("*")
         .eq("room_code", cleanCode)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
+        .neq("status", "finished") // Don't join old games
+        .order('created_at', { ascending: false });
 
-      if (findError || !existingRoom) {
-        toast({ title: "Room not found", description: "Check code and try again.", variant: "destructive" });
+      if (findError || !rooms || rooms.length === 0) {
+        toast({ title: "Room not found", description: "The code is incorrect or the game ended.", variant: "destructive" });
         return;
       }
 
-      // Step 2: Handle Re-joining (if you are already P1 or P2)
-      if (existingRoom.player1_id === user.id || existingRoom.player2_id === user.id) {
-        setRoom(existingRoom);
-        setRoomId(existingRoom.id);
-        setScreen(existingRoom.status === "waiting" ? "waiting" : "playing");
-        if (existingRoom.status === "playing") loadQuestion();
+      const targetRoom = rooms[0];
+
+      // Step 2: If user is already in this room, just enter it
+      if (targetRoom.player1_id === user.id || targetRoom.player2_id === user.id) {
+        setRoom(targetRoom);
+        setRoomId(targetRoom.id);
+        setScreen(targetRoom.status === "waiting" ? "waiting" : "playing");
+        if (targetRoom.status === "playing") loadQuestion();
         return;
       }
 
-      // Step 3: Join as Player 2
-      if (existingRoom.status !== "waiting" || existingRoom.player2_id) {
+      // Step 3: Check if room is available
+      if (targetRoom.player2_id) {
         toast({ title: "Room is full", variant: "destructive" });
         return;
       }
 
-      const { data: joinedRoom, error: joinError } = await supabase
+      // Step 4: Perform the Join Update
+      const { data: updated, error: updateError } = await supabase
         .from("multiplayer_rooms")
         .update({
           player2_id: user.id,
           player2_username: profile.username,
-          status: "playing" // This starts the game for both
+          status: "playing"
         })
-        .eq("id", existingRoom.id)
+        .eq("id", targetRoom.id)
         .select()
         .single();
 
-      if (joinError) throw joinError;
+      if (updateError) {
+        console.error("Supabase Update Error:", updateError);
+        throw new Error(updateError.message);
+      }
 
-      setRoom(joinedRoom);
-      setRoomId(joinedRoom.id);
+      setRoom(updated);
+      setRoomId(updated.id);
       setScreen("playing");
       loadQuestion();
-    } catch (err) {
-      console.error("Join Error:", err);
-      toast({ title: "Join failed", description: "Try again in a moment.", variant: "destructive" });
+      
+    } catch (err: any) {
+      console.error("Detailed Join Error:", err);
+      toast({ 
+        title: "Join Failed", 
+        description: err.message || "Connection error. Try again.", 
+        variant: "destructive" 
+      });
     } finally {
       setIsJoining(false);
     }
@@ -184,13 +193,13 @@ const MultiplayerGame = () => {
       setRoomId(data.id);
       setScreen("waiting");
     } catch (err) {
-      toast({ title: "Creation failed", variant: "destructive" });
+      toast({ title: "Room creation failed", variant: "destructive" });
     } finally {
       setIsCreating(false);
     }
   };
 
-  // --- 5. Game Play Actions ---
+  // --- 5. Game Play Logic ---
   const handleAnswer = async (answer: number) => {
     if (isChecking || feedback || !roomId) return;
     setSelectedAnswer(answer);
@@ -213,36 +222,37 @@ const MultiplayerGame = () => {
       }
 
       setRoundResults(prev => [...prev, { round: room.current_round, correct: isCorrect, timeUsed }]);
-      setTimeout(() => proceedToNextStep(), 1500);
+      setTimeout(() => proceedToNextStep(), 1200);
     } catch (err) {
-      toast({ title: "Error checking answer" });
+      toast({ title: "Connection error" });
     } finally {
       setIsChecking(false);
     }
   };
 
   const proceedToNextStep = async () => {
+    if (!roomId) return;
     const currentRound = room?.current_round ?? 1;
+
     if (currentRound >= MAX_ROUNDS) {
-      const p1Score = room.player1_score;
-      const p2Score = room.player2_score;
-      const winnerId = p1Score > p2Score ? room.player1_id : p1Score < p2Score ? room.player2_id : null;
+      const winnerId = room.player1_score > room.player2_score ? room.player1_id : 
+                       room.player2_score > room.player1_score ? room.player2_id : null;
       
-      await supabase.from("multiplayer_rooms").update({ status: "finished", winner_id: winnerId }).eq("id", roomId!);
+      await supabase.from("multiplayer_rooms").update({ status: "finished", winner_id: winnerId }).eq("id", roomId);
       
-      // Update global profile stats
-      const myScore = isPlayer1 ? p1Score : p2Score;
+      const myScore = isPlayer1 ? room.player1_score : room.player2_score;
       await supabase.from("profiles").update({
         coins: (profile?.coins ?? 0) + (myScore * 100),
         games_played: (profile?.games_played ?? 0) + 1
       }).eq("user_id", user?.id);
       refreshProfile();
     } else if (isPlayer1) {
-      await supabase.from("multiplayer_rooms").update({ current_round: currentRound + 1 }).eq("id", roomId!);
+      // Only Player 1 increments the round to avoid race conditions
+      await supabase.from("multiplayer_rooms").update({ current_round: currentRound + 1 }).eq("id", roomId);
     }
   };
 
-  // Timer
+  // Timer Effect
   useEffect(() => {
     if (screen !== "playing" || feedback) return;
     if (timeLeft <= 0) { proceedToNextStep(); return; }
@@ -250,24 +260,17 @@ const MultiplayerGame = () => {
     return () => clearInterval(timer);
   }, [timeLeft, screen, feedback]);
 
-  // UI Utilities
-  const copyCode = () => {
-    navigator.clipboard.writeText(room?.room_code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   // --- Render ---
   if (screen === "lobby") {
     return (
       <div className="min-h-screen sky-gradient flex items-center justify-center p-4">
-        <Card className="w-full max-w-md border-2 border-secondary/30 game-card-glow">
+        <Card className="w-full max-w-md border-2 border-secondary/30 shadow-2xl">
           <CardContent className="p-8">
             <Button variant="ghost" onClick={() => navigate("/dashboard")} className="mb-4">
               <ArrowLeft className="w-4 h-4 mr-2" /> Back
             </Button>
             <h2 className="text-3xl font-display text-center mb-6">Multiplayer</h2>
-            <Button onClick={createRoom} disabled={isCreating} className="w-full h-14 bg-secondary hover:bg-secondary/90 text-lg mb-6">
+            <Button onClick={createRoom} disabled={isCreating} className="w-full h-14 bg-secondary hover:bg-secondary/90 text-lg mb-8 shadow-lg">
               {isCreating ? <Loader2 className="animate-spin" /> : "🎮 Create Room"}
             </Button>
             <div className="flex gap-2">
@@ -275,10 +278,10 @@ const MultiplayerGame = () => {
                 placeholder="6-DIGIT CODE"
                 value={joinCode}
                 onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                className="text-center font-mono tracking-widest"
+                className="text-center font-mono tracking-widest uppercase h-12"
                 maxLength={6}
               />
-              <Button onClick={() => joinRoomWithCode(joinCode)} disabled={isJoining || joinCode.length < 6}>
+              <Button onClick={() => joinRoomWithCode(joinCode)} disabled={isJoining || joinCode.length < 6} className="h-12 px-6">
                 {isJoining ? <Loader2 className="animate-spin" /> : "Join"}
               </Button>
             </div>
@@ -294,12 +297,17 @@ const MultiplayerGame = () => {
         <Card className="w-full max-w-md text-center p-8">
           <Loader2 className="w-12 h-12 mx-auto mb-4 animate-spin text-secondary" />
           <h2 className="text-2xl font-display mb-6">Waiting for Opponent...</h2>
-          <div className="bg-muted p-6 rounded-lg mb-4">
-            <p className="text-4xl font-mono font-bold text-primary tracking-widest">{room?.room_code}</p>
+          <div className="bg-muted p-6 rounded-lg mb-6 border-2 border-dashed border-primary/20">
+            <p className="text-sm text-muted-foreground mb-2 uppercase font-bold tracking-tighter">Room Code</p>
+            <p className="text-5xl font-mono font-bold text-primary tracking-[0.2em]">{room?.room_code}</p>
           </div>
-          <Button variant="outline" className="w-full" onClick={copyCode}>
+          <Button variant="outline" className="w-full h-12" onClick={() => {
+            navigator.clipboard.writeText(room?.room_code);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 2000);
+          }}>
             {copied ? <Check className="w-4 h-4 mr-2" /> : <Copy className="w-4 h-4 mr-2" />}
-            {copied ? "Copied" : "Copy Room Code"}
+            {copied ? "Copied!" : "Copy Room Code"}
           </Button>
         </Card>
       </div>
@@ -322,41 +330,48 @@ const MultiplayerGame = () => {
         playerName={profile?.username || "You"}
         isWinner={room?.winner_id === user?.id}
         isDraw={!room?.winner_id && myScore === oppScore}
-        onPlayAgain={() => { setScreen("lobby"); setRoomId(null); setRoom(null); }}
+        onPlayAgain={() => { setScreen("lobby"); setRoomId(null); setRoom(null); setRoundResults([]); }}
       />
     );
   }
 
+  // --- Playing Game UI ---
   return (
     <div className="min-h-screen sky-gradient">
-      <header className="bg-card/80 backdrop-blur-sm border-b p-4">
+      <header className="bg-card/90 backdrop-blur-md border-b p-4 shadow-sm sticky top-0 z-50">
         <div className="container mx-auto flex justify-between items-center">
           <div className="flex gap-4 items-center">
-            <div className="text-center">
-              <span className="text-[10px] uppercase block opacity-60">{room?.player1_username}</span>
+            <div className="text-center px-3">
+              <span className="text-[10px] uppercase font-bold opacity-60 block">{room?.player1_username}</span>
               <span className="text-2xl font-display text-primary">{room?.player1_score}</span>
             </div>
-            <span className="opacity-20">VS</span>
-            <div className="text-center">
-              <span className="text-[10px] uppercase block opacity-60">{room?.player2_username}</span>
+            <div className="w-[1px] h-8 bg-border" />
+            <div className="text-center px-3">
+              <span className="text-[10px] uppercase font-bold opacity-60 block">{room?.player2_username}</span>
               <span className="text-2xl font-display text-secondary">{room?.player2_score}</span>
             </div>
           </div>
-          <div className="text-center">
-            <p className="text-xs uppercase text-muted-foreground">Round</p>
-            <p className="font-display text-xl">{room?.current_round}/{MAX_ROUNDS}</p>
+          <div className="bg-secondary/10 px-4 py-1 rounded-full border border-secondary/20">
+            <span className="text-xs uppercase text-muted-foreground mr-2 font-bold">Round</span>
+            <span className="font-display text-xl">{room?.current_round}/{MAX_ROUNDS}</span>
           </div>
-          <div className={`px-4 py-2 rounded-full font-bold flex gap-2 items-center ${timeLeft < 10 ? 'bg-red-500 text-white' : 'bg-primary/20'}`}>
+          <div className={`px-4 py-2 rounded-xl font-bold flex gap-2 items-center transition-colors border-2 ${
+            timeLeft < 10 ? 'bg-red-500 border-red-600 text-white animate-pulse' : 'bg-primary/10 border-primary/20'
+          }`}>
             <Clock className="w-5 h-5" /> {timeLeft}s
           </div>
         </div>
       </header>
 
       <main className="container mx-auto py-8 px-4 max-w-2xl">
-        <Card className="game-card-glow">
+        <Card className="border-2 border-primary/10 shadow-xl overflow-hidden">
           <CardContent className="p-6">
-            <div className="aspect-video bg-white rounded-lg mb-8 flex items-center justify-center overflow-hidden border-4">
-              {isLoading ? <Loader2 className="animate-spin" /> : <img src={questionUrl} alt="puzzle" className="max-h-full" />}
+            <div className="aspect-video bg-white rounded-xl mb-8 flex items-center justify-center border shadow-inner">
+              {isLoading ? (
+                <Loader2 className="w-12 h-12 animate-spin text-secondary" />
+              ) : (
+                <img src={questionUrl} alt="puzzle" className="max-h-full object-contain p-4" />
+              )}
             </div>
             <div className="grid grid-cols-5 gap-3">
               {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
@@ -365,9 +380,9 @@ const MultiplayerGame = () => {
                   variant={selectedAnswer === num ? "default" : "outline"}
                   disabled={isLoading || isChecking || feedback !== null}
                   onClick={() => handleAnswer(num)}
-                  className={`text-2xl font-display h-16 ${
-                    selectedAnswer === num && feedback === "correct" ? "bg-success text-white" : 
-                    selectedAnswer === num && feedback === "wrong" ? "bg-destructive text-white" : ""
+                  className={`text-3xl font-display h-20 transition-all ${
+                    selectedAnswer === num && feedback === "correct" ? "bg-green-500 text-white hover:bg-green-500 scale-105" : 
+                    selectedAnswer === num && feedback === "wrong" ? "bg-red-500 text-white hover:bg-red-500" : ""
                   }`}
                 >
                   {num}
